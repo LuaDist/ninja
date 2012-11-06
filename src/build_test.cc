@@ -178,9 +178,9 @@ TEST_F(PlanTest, DependencyCycle) {
 
 struct BuildTest : public StateTestWithBuiltinRules,
                    public CommandRunner {
-  BuildTest() : config_(MakeConfig()), builder_(&state_, config_), now_(1),
-                last_command_(NULL) {
-    builder_.disk_interface_ = &fs_;
+  BuildTest() : config_(MakeConfig()),
+                builder_(&state_, config_, NULL, &fs_),
+                now_(1), last_command_(NULL), status_(config_) {
     builder_.command_runner_.reset(this);
     AssertParse(&state_,
 "build cat1: cat in1\n"
@@ -202,8 +202,8 @@ struct BuildTest : public StateTestWithBuiltinRules,
   virtual bool CanRunMore();
   virtual bool StartCommand(Edge* edge);
   virtual Edge* WaitForCommand(ExitStatus* status, string* output);
-  virtual vector<Edge*> GetActiveEdges(); 
-  virtual void Abort(); 
+  virtual vector<Edge*> GetActiveEdges();
+  virtual void Abort();
 
   BuildConfig MakeConfig() {
     BuildConfig config;
@@ -212,13 +212,13 @@ struct BuildTest : public StateTestWithBuiltinRules,
   }
 
   BuildConfig config_;
+  VirtualFileSystem fs_;
   Builder builder_;
   int now_;
 
-  VirtualFileSystem fs_;
-
   vector<string> commands_ran_;
   Edge* last_command_;
+  BuildStatus status_;
 };
 
 void BuildTest::Dirty(const string& path) {
@@ -718,11 +718,36 @@ TEST_F(BuildTest, SwallowFailuresLimit) {
 
 struct BuildWithLogTest : public BuildTest {
   BuildWithLogTest() {
-    state_.build_log_ = builder_.log_ = &build_log_;
+    builder_.SetBuildLog(&build_log_);
   }
 
   BuildLog build_log_;
 };
+
+TEST_F(BuildWithLogTest, NotInLogButOnDisk) {
+  ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
+"rule cc\n"
+"  command = cc\n"
+"build out1: cc in\n"));
+
+  // Create input/output that would be considered up to date when
+  // not considering the command line hash.
+  fs_.Create("in", now_, "");
+  fs_.Create("out1", now_, "");
+  string err;
+
+  // Because it's not in the log, it should not be up-to-date until
+  // we build again.
+  EXPECT_TRUE(builder_.AddTarget("out1", &err));
+  EXPECT_FALSE(builder_.AlreadyUpToDate());
+
+  commands_ran_.clear();
+  state_.Reset();
+
+  EXPECT_TRUE(builder_.AddTarget("out1", &err));
+  EXPECT_TRUE(builder_.Build(&err));
+  EXPECT_TRUE(builder_.AlreadyUpToDate());
+}
 
 TEST_F(BuildWithLogTest, RestatTest) {
   ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
@@ -744,9 +769,22 @@ TEST_F(BuildWithLogTest, RestatTest) {
 
   fs_.Create("in", now_, "");
 
+  // Do a pre-build so that there's commands in the log for the outputs,
+  // otherwise, the lack of an entry in the build log will cause out3 to rebuild
+  // regardless of restat.
+  string err;
+  EXPECT_TRUE(builder_.AddTarget("out3", &err));
+  ASSERT_EQ("", err);
+  EXPECT_TRUE(builder_.Build(&err));
+  ASSERT_EQ("", err);
+  commands_ran_.clear();
+  state_.Reset();
+
+  now_++;
+
+  fs_.Create("in", now_, "");
   // "cc" touches out1, so we should build out2.  But because "true" does not
   // touch out2, we should cancel the build of out3.
-  string err;
   EXPECT_TRUE(builder_.AddTarget("out3", &err));
   ASSERT_EQ("", err);
   EXPECT_TRUE(builder_.Build(&err));
@@ -791,14 +829,82 @@ TEST_F(BuildWithLogTest, RestatMissingFile) {
   fs_.Create("in", now_, "");
   fs_.Create("out2", now_, "");
 
-  // Run a build, expect only the first command to run.
-  // It doesn't touch its output (due to being the "true" command), so
-  // we shouldn't run the dependent build.
+  // Do a pre-build so that there's commands in the log for the outputs,
+  // otherwise, the lack of an entry in the build log will cause out2 to rebuild
+  // regardless of restat.
   string err;
   EXPECT_TRUE(builder_.AddTarget("out2", &err));
   ASSERT_EQ("", err);
   EXPECT_TRUE(builder_.Build(&err));
+  ASSERT_EQ("", err);
+  commands_ran_.clear();
+  state_.Reset();
+
+  now_++;
+  fs_.Create("in", now_, "");
+  fs_.Create("out2", now_, "");
+
+  // Run a build, expect only the first command to run.
+  // It doesn't touch its output (due to being the "true" command), so
+  // we shouldn't run the dependent build.
+  EXPECT_TRUE(builder_.AddTarget("out2", &err));
+  ASSERT_EQ("", err);
+  EXPECT_TRUE(builder_.Build(&err));
   ASSERT_EQ(1u, commands_ran_.size());
+}
+
+// Test scenario, in which an input file is removed, but output isn't changed
+// https://github.com/martine/ninja/issues/295
+TEST_F(BuildWithLogTest, RestatMissingInput) {
+  ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
+    "rule true\n"
+    "  command = true\n"
+    "  depfile = $out.d\n"
+    "  restat = 1\n"
+    "rule cc\n"
+    "  command = cc\n"
+    "build out1: true in\n"
+    "build out2: cc out1\n"));
+
+  // Create all necessary files
+  fs_.Create("in", now_, "");
+
+  // The implicit dependencies and the depfile itself 
+  // are newer than the output
+  TimeStamp restat_mtime = ++now_;
+  fs_.Create("out1.d", now_, "out1: will.be.deleted restat.file\n");
+  fs_.Create("will.be.deleted", now_, "");
+  fs_.Create("restat.file", now_, "");
+
+  // Run the build, out1 and out2 get built
+  string err;
+  EXPECT_TRUE(builder_.AddTarget("out2", &err));
+  ASSERT_EQ("", err);
+  EXPECT_TRUE(builder_.Build(&err));
+  ASSERT_EQ(2u, commands_ran_.size());
+
+  // See that an entry in the logfile is created, capturing
+  // the right mtime
+  BuildLog::LogEntry * log_entry = build_log_.LookupByOutput("out1");
+  ASSERT_TRUE(NULL != log_entry);
+  ASSERT_EQ(restat_mtime, log_entry->restat_mtime);
+
+  // Now remove a file, referenced from depfile, so that target becomes 
+  // dirty, but the output does not change
+  fs_.RemoveFile("will.be.deleted");
+  
+  // Trigger the build again - only out1 gets built
+  commands_ran_.clear();
+  state_.Reset();
+  EXPECT_TRUE(builder_.AddTarget("out2", &err));
+  ASSERT_EQ("", err);
+  EXPECT_TRUE(builder_.Build(&err));
+  ASSERT_EQ(1u, commands_ran_.size());
+
+  // Check that the logfile entry remains correctly set
+  log_entry = build_log_.LookupByOutput("out1");
+  ASSERT_TRUE(NULL != log_entry);
+  ASSERT_EQ(restat_mtime, log_entry->restat_mtime);
 }
 
 struct BuildDryRun : public BuildWithLogTest {
@@ -837,7 +943,7 @@ TEST_F(BuildDryRun, AllCommandsShown) {
 }
 
 // Test that RSP files are created when & where appropriate and deleted after
-// succesful execution.
+// successful execution.
 TEST_F(BuildTest, RspFileSuccess)
 {
   ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
@@ -853,7 +959,7 @@ TEST_F(BuildTest, RspFileSuccess)
   fs_.Create("out1", now_, "");
   fs_.Create("out2", now_, "");
   fs_.Create("out3", now_, "");
-    
+
   now_++;
 
   fs_.Create("in", now_, "");
@@ -869,11 +975,11 @@ TEST_F(BuildTest, RspFileSuccess)
 
   EXPECT_TRUE(builder_.Build(&err));
   ASSERT_EQ(2u, commands_ran_.size()); // cat + cat_rsp
-    
+
   // The RSP file was created
   ASSERT_EQ(files_created + 1, fs_.files_created_.size());
   ASSERT_EQ(1u, fs_.files_created_.count("out2.rsp"));
-    
+
   // The RSP file was removed
   ASSERT_EQ(files_removed + 1, fs_.files_removed_.size());
   ASSERT_EQ(1u, fs_.files_removed_.count("out2.rsp"));
@@ -917,7 +1023,7 @@ TEST_F(BuildTest, RspFileFailure) {
   ASSERT_EQ("Another very long command", fs_.files_["out.rsp"].contents);
 }
 
-// Test that contens of the RSP file behaves like a regular part of 
+// Test that contens of the RSP file behaves like a regular part of
 // command line, i.e. triggers a rebuild if changed
 TEST_F(BuildWithLogTest, RspFileCmdLineChange) {
   ASSERT_NO_FATAL_FAILURE(AssertParse(&state_,
@@ -948,12 +1054,14 @@ TEST_F(BuildWithLogTest, RspFileCmdLineChange) {
   EXPECT_EQ("", err);
   ASSERT_TRUE(builder_.AlreadyUpToDate());
 
-  // 3. Alter the entry in the logfile 
+  // 3. Alter the entry in the logfile
   // (to simulate a change in the command line between 2 builds)
   BuildLog::LogEntry * log_entry = build_log_.LookupByOutput("out");
   ASSERT_TRUE(NULL != log_entry);
-  ASSERT_EQ("cat out.rsp > out;rspfile=Original very long command", log_entry->command);
-  log_entry->command = "cat out.rsp > out;rspfile=Altered very long command";
+  ASSERT_NO_FATAL_FAILURE(AssertHash(
+        "cat out.rsp > out;rspfile=Original very long command",
+        log_entry->command_hash));
+  log_entry->command_hash++;  // Change the command hash to something else.
   // Now expect the target to be rebuilt
   commands_ran_.clear();
   state_.Reset();
@@ -1021,4 +1129,9 @@ TEST_F(BuildTest, PhonyWithNoInputs) {
   EXPECT_TRUE(builder_.Build(&err));
   EXPECT_EQ("", err);
   ASSERT_EQ(1u, commands_ran_.size());
+}
+
+TEST_F(BuildTest, StatusFormatReplacePlaceholder) {
+  EXPECT_EQ("[%/s0/t0/r0/u0/f0]",
+            status_.FormatProgressStatus("[%%/s%s/t%t/r%r/u%u/f%f]"));
 }

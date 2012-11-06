@@ -29,6 +29,7 @@ Cleaner::Cleaner(State* state, const BuildConfig& config)
   : state_(state),
     config_(config),
     removed_(),
+    cleaned_(),
     cleaned_files_count_(0),
     disk_interface_(new RealDiskInterface),
     status_(0) {
@@ -40,6 +41,7 @@ Cleaner::Cleaner(State* state,
   : state_(state),
     config_(config),
     removed_(),
+    cleaned_(),
     cleaned_files_count_(0),
     disk_interface_(disk_interface),
     status_(0) {
@@ -80,6 +82,16 @@ bool Cleaner::IsAlreadyRemoved(const string& path) {
   return (i != removed_.end());
 }
 
+void Cleaner::RemoveEdgeFiles(Edge* edge) {
+  string depfile = edge->EvaluateDepFile();
+  if (!depfile.empty())
+    Remove(depfile);
+
+  string rspfile = edge->GetRspFile();
+  if (!rspfile.empty())
+    Remove(rspfile);
+}
+
 void Cleaner::PrintHeader() {
   if (config_.verbosity == BuildConfig::QUIET)
     return;
@@ -102,7 +114,7 @@ int Cleaner::CleanAll(bool generator) {
   for (vector<Edge*>::iterator e = state_->edges_.begin();
        e != state_->edges_.end(); ++e) {
     // Do not try to remove phony targets
-    if ((*e)->rule_ == &State::kPhonyRule)
+    if ((*e)->is_phony())
       continue;
     // Do not remove generator's files unless generator specified.
     if (!generator && (*e)->rule().generator())
@@ -111,30 +123,32 @@ int Cleaner::CleanAll(bool generator) {
          out_node != (*e)->outputs_.end(); ++out_node) {
       Remove((*out_node)->path());
     }
-    // Remove the depfile
-    if (!(*e)->rule().depfile().empty())
-      Remove((*e)->EvaluateDepFile());
-    // Remove the response file
-    if ((*e)->HasRspFile()) 
-      Remove((*e)->GetRspFile());      
+
+    RemoveEdgeFiles(*e);
   }
   PrintFooter();
   return status_;
 }
 
 void Cleaner::DoCleanTarget(Node* target) {
-  if (target->in_edge()) {
-    Remove(target->path());
-    if (!target->in_edge()->rule().depfile().empty())
-      Remove(target->in_edge()->EvaluateDepFile());
-    if (target->in_edge()->HasRspFile())
-      Remove(target->in_edge()->GetRspFile());
-    for (vector<Node*>::iterator n = target->in_edge()->inputs_.begin();
-         n != target->in_edge()->inputs_.end();
+  if (Edge* e = target->in_edge()) {
+    // Do not try to remove phony targets
+    if (!e->is_phony()) {
+      Remove(target->path());
+      RemoveEdgeFiles(e);
+    }
+    for (vector<Node*>::iterator n = e->inputs_.begin(); n != e->inputs_.end();
          ++n) {
-      DoCleanTarget(*n);
+      Node* next = *n;
+      // call DoCleanTarget recursively if this node has not been visited
+      if (cleaned_.count(next) == 0) {
+        DoCleanTarget(next);
+      }
     }
   }
+
+  // mark this target to be cleaned already
+  cleaned_.insert(target);
 }
 
 int Cleaner::CleanTarget(Node* target) {
@@ -189,10 +203,7 @@ void Cleaner::DoCleanRule(const Rule* rule) {
       for (vector<Node*>::iterator out_node = (*e)->outputs_.begin();
            out_node != (*e)->outputs_.end(); ++out_node) {
         Remove((*out_node)->path());
-        if (!(*e)->rule().depfile().empty())
-          Remove((*e)->EvaluateDepFile());
-        if ((*e)->HasRspFile()) 
-          Remove((*e)->GetRspFile());
+        RemoveEdgeFiles(*e);
       }
     }
   }
@@ -247,4 +258,5 @@ void Cleaner::Reset() {
   status_ = 0;
   cleaned_files_count_ = 0;
   removed_.clear();
+  cleaned_.clear();
 }

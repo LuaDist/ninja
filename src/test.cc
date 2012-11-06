@@ -18,7 +18,8 @@
 
 #include <errno.h>
 
-#include "parsers.h"
+#include "build_log.h"
+#include "manifest_parser.h"
 #include "util.h"
 
 #ifdef _WIN32
@@ -87,6 +88,10 @@ void AssertParse(State* state, const char* input) {
   string err;
   ASSERT_TRUE(parser.ParseTest(input, &err)) << err;
   ASSERT_EQ("", err);
+}
+
+void AssertHash(const char* expected, uint64_t actual) {
+  ASSERT_EQ(BuildLog::LogEntry::HashCommand(expected), actual);
 }
 
 void VirtualFileSystem::Create(const string& path, int time,

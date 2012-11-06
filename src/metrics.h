@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#ifndef NINJA_METRICS_H_
+#define NINJA_METRICS_H_
+
 #include <string>
 #include <vector>
 using namespace std;
@@ -29,6 +32,7 @@ struct Metric {
   /// Total time (in micros) we've spent on the code path.
   int64_t sum;
 };
+
 
 /// A scoped object for recording a metric across the body of a function.
 /// Used by the METRIC_RECORD macro.
@@ -54,6 +58,26 @@ private:
   vector<Metric*> metrics_;
 };
 
+/// Get the current time as relative to some epoch.
+/// Epoch varies between platforms; only useful for measuring elapsed time.
+int64_t GetTimeMillis();
+
+/// A simple stopwatch which returns the time
+/// in seconds since Restart() was called.
+class Stopwatch {
+ public:
+  Stopwatch() : started_(0) {}
+
+  /// Seconds since Restart() call.
+  double Elapsed() const { return 1e-6 * static_cast<double>(Now() - started_); }
+
+  void Restart() { started_ = Now(); }
+
+private:
+  uint64_t started_;
+  uint64_t Now() const;
+};
+
 /// The primary interface to metrics.  Use METRIC_RECORD("foobar") at the top
 /// of a function to get timing stats recorded for each call of the function.
 #define METRIC_RECORD(name)                                             \
@@ -62,3 +86,5 @@ private:
   ScopedMetric metrics_h_scoped(metrics_h_metric);
 
 extern Metrics* g_metrics;
+
+#endif // NINJA_METRICS_H_

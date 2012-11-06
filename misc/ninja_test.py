@@ -15,7 +15,11 @@
 # limitations under the License.
 
 import unittest
-from StringIO import StringIO
+
+try:
+    from StringIO import StringIO
+except ImportError:
+    from io import StringIO
 
 import ninja_syntax
 
@@ -39,6 +43,18 @@ class TestLineWordWrap(unittest.TestCase):
         self.assertEqual(' $\n'.join(['x',
                                       INDENT + LONGWORD,
                                       INDENT + 'y']) + '\n',
+                         self.out.getvalue())
+
+    def test_short_words_indented(self):
+        # Test that indent is taking into acount when breaking subsequent lines.
+        # The second line should not be '    to tree', as that's longer than the
+        # test layout width of 8.
+        self.n._line('line_one to tree')
+        self.assertEqual('''\
+line_one $
+    to $
+    tree
+''',
                          self.out.getvalue())
 
     def test_few_long_words_indented(self):

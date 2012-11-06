@@ -72,6 +72,7 @@ int64_t TimerToMicros(int64_t dt) {
 
 }  // anonymous namespace
 
+
 ScopedMetric::ScopedMetric(Metric* metric) {
   metric_ = metric;
   if (!metric_)
@@ -102,14 +103,23 @@ void Metrics::Report() {
     width = max((int)(*i)->name.size(), width);
   }
 
-  printf("%-*s\t%-6s\t%9s\t%s\n", width,
-         "metric", "count", "total (ms)" , "avg (us)");
+  printf("%-*s\t%-6s\t%-9s\t%s\n", width,
+         "metric", "count", "avg (us)", "total (ms)");
   for (vector<Metric*>::iterator i = metrics_.begin();
        i != metrics_.end(); ++i) {
     Metric* metric = *i;
     double total = metric->sum / (double)1000;
     double avg = metric->sum / (double)metric->count;
     printf("%-*s\t%-6d\t%-8.1f\t%.1f\n", width, metric->name.c_str(),
-           metric->count, total, avg);
+           metric->count, avg, total);
   }
 }
+
+uint64_t Stopwatch::Now() const {
+  return TimerToMicros(HighResTimer());
+}
+
+int64_t GetTimeMillis() {
+  return TimerToMicros(HighResTimer()) / 1000;
+}
+

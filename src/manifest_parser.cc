@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "parsers.h"
+#include "manifest_parser.h"
 
 #include <assert.h>
 #include <errno.h>
@@ -76,8 +76,9 @@ bool ManifestParser::Parse(const string& filename, const string& input,
       if (!ParseFileInclude(true, err))
         return false;
       break;
-    case Lexer::ERROR:
-      return lexer_.Error("lexing error", err);
+    case Lexer::ERROR: {
+      return lexer_.Error(lexer_.DescribeLastError(), err);
+    }
     case Lexer::TEOF:
       return true;
     case Lexer::NEWLINE:
@@ -218,7 +219,7 @@ bool ManifestParser::ParseEdge(string* err) {
     ins.push_back(in);
   }
 
-  // Add all order-only deps, counting how many as we go.
+  // Add all implicit deps, counting how many as we go.
   int implicit = 0;
   if (lexer_.PeekToken(Lexer::PIPE)) {
     for (;;) {

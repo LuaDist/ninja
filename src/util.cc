@@ -34,8 +34,13 @@
 
 #include <vector>
 
-#ifdef _WIN32
-#include <direct.h>  // _mkdir
+#if defined(__APPLE__) || defined(__FreeBSD__)
+#include <sys/sysctl.h>
+#elif defined(__SVR4) && defined(__sun)
+#include <unistd.h>
+#include <sys/loadavg.h>
+#elif defined(linux)
+#include <sys/sysinfo.h>
 #endif
 
 #include "edit_distance.h"
@@ -43,7 +48,7 @@
 
 void Fatal(const char* msg, ...) {
   va_list ap;
-  fprintf(stderr, "ninja: FATAL: ");
+  fprintf(stderr, "ninja: fatal: ");
   va_start(ap, msg);
   vfprintf(stderr, msg, ap);
   va_end(ap);
@@ -61,7 +66,7 @@ void Fatal(const char* msg, ...) {
 
 void Warning(const char* msg, ...) {
   va_list ap;
-  fprintf(stderr, "ninja: WARNING: ");
+  fprintf(stderr, "ninja: warning: ");
   va_start(ap, msg);
   vfprintf(stderr, msg, ap);
   va_end(ap);
@@ -70,7 +75,7 @@ void Warning(const char* msg, ...) {
 
 void Error(const char* msg, ...) {
   va_list ap;
-  fprintf(stderr, "ninja: ERROR: ");
+  fprintf(stderr, "ninja: error: ");
   va_start(ap, msg);
   vfprintf(stderr, msg, ap);
   va_end(ap);
@@ -79,7 +84,7 @@ void Error(const char* msg, ...) {
 
 bool CanonicalizePath(string* path, string* err) {
   METRIC_RECORD("canonicalize str");
-  int len = path->size();
+  size_t len = path->size();
   char* str = 0;
   if (len > 0)
     str = &(*path)[0];
@@ -89,7 +94,7 @@ bool CanonicalizePath(string* path, string* err) {
   return true;
 }
 
-bool CanonicalizePath(char* path, int* len, string* err) {
+bool CanonicalizePath(char* path, size_t* len, string* err) {
   // WARNING: this function is performance-critical; please benchmark
   // any changes you make to it.
   METRIC_RECORD("canonicalize path");
@@ -108,45 +113,55 @@ bool CanonicalizePath(char* path, int* len, string* err) {
   const char* end = start + *len;
 
   if (*src == '/') {
+#ifdef _WIN32
+    // network path starts with //
+    if (*len > 1 && *(src + 1) == '/') {
+      src += 2;
+      dst += 2;
+    } else {
+      ++src;
+      ++dst;
+    }
+#else
     ++src;
     ++dst;
+#endif
   }
 
   while (src < end) {
-    const char* sep = (const char*)memchr(src, '/', end - src);
-    if (sep == NULL)
-      sep = end;
-
     if (*src == '.') {
-      if (sep - src == 1) {
+      if (src + 1 == end || src[1] == '/') {
         // '.' component; eliminate.
         src += 2;
         continue;
-      } else if (sep - src == 2 && src[1] == '.') {
+      } else if (src[1] == '.' && (src + 2 == end || src[2] == '/')) {
         // '..' component.  Back up if possible.
         if (component_count > 0) {
           dst = components[component_count - 1];
           src += 3;
           --component_count;
         } else {
-          while (src <= sep)
-            *dst++ = *src++;
+          *dst++ = *src++;
+          *dst++ = *src++;
+          *dst++ = *src++;
         }
         continue;
       }
     }
 
-    if (sep > src) {
-      if (component_count == kMaxPathComponents)
-        Fatal("path has too many components");
-      components[component_count] = dst;
-      ++component_count;
-      while (src <= sep) {
-        *dst++ = *src++;
-      }
+    if (*src == '/') {
+      src++;
+      continue;
     }
 
-    src = sep + 1;
+    if (component_count == kMaxPathComponents)
+      Fatal("path has too many components");
+    components[component_count] = dst;
+    ++component_count;
+
+    while (*src != '/' && src != end)
+      *dst++ = *src++;
+    *dst++ = *src++;  // Copy '/' or final \0 character as well.
   }
 
   if (dst == start) {
@@ -156,14 +171,6 @@ bool CanonicalizePath(char* path, int* len, string* err) {
 
   *len = dst - start - 1;
   return true;
-}
-
-int MakeDir(const string& path) {
-#ifdef _WIN32
-  return _mkdir(path.c_str());
-#else
-  return mkdir(path.c_str(), 0777);
-#endif
 }
 
 int ReadFile(const string& path, string* contents, string* err) {
@@ -205,16 +212,6 @@ void SetCloseOnExec(int fd) {
 #endif  // ! _WIN32
 }
 
-int64_t GetTimeMillis() {
-#ifdef _WIN32
-  // GetTickCount64 is only available on Vista or later.
-  return GetTickCount();
-#else
-  timeval now;
-  gettimeofday(&now, NULL);
-  return ((int64_t)now.tv_sec * 1000) + (now.tv_usec / 1000);
-#endif
-}
 
 const char* SpellcheckStringV(const string& text,
                               const vector<const char*>& words) {
@@ -264,6 +261,10 @@ string GetLastErrorString() {
   LocalFree(msg_buf);
   return msg;
 }
+
+void Win32Fatal(const char* function) {
+  Fatal("%s: %s", function, GetLastErrorString().c_str());
+}
 #endif
 
 static bool islatinalpha(int c) {
@@ -292,4 +293,64 @@ string StripAnsiEscapeCodes(const string& in) {
       ++i;
   }
   return stripped;
+}
+
+#if defined(linux)
+int GetProcessorCount() {
+  return get_nprocs();
+}
+#elif defined(__APPLE__) || defined(__FreeBSD__)
+int GetProcessorCount() {
+  int processors;
+  size_t processors_size = sizeof(processors);
+  int name[] = {CTL_HW, HW_NCPU};
+  if (sysctl(name, sizeof(name) / sizeof(int),
+             &processors, &processors_size,
+             NULL, 0) < 0) {
+    return 0;
+  }
+  return processors;
+}
+#elif defined(_WIN32)
+int GetProcessorCount() {
+  SYSTEM_INFO info;
+  GetSystemInfo(&info);
+  return info.dwNumberOfProcessors;
+}
+#else
+// This is what get_nprocs() should be doing in the Linux implementation
+// above, but in a more standard way.
+int GetProcessorCount() {
+  return sysconf(_SC_NPROCESSORS_ONLN);
+}
+#endif
+
+#ifdef _WIN32
+double GetLoadAverage() {
+  // TODO(nicolas.despres@gmail.com): Find a way to implement it on Windows.
+  // Remember to also update Usage() when this is fixed.
+  return -0.0f;
+}
+#else
+double GetLoadAverage() {
+  double loadavg[3] = { 0.0f, 0.0f, 0.0f };
+  if (getloadavg(loadavg, 3) < 0) {
+    // Maybe we should return an error here or the availability of
+    // getloadavg(3) should be checked when ninja is configured.
+    return -0.0f;
+  }
+  return loadavg[0];
+}
+#endif // _WIN32
+
+string ElideMiddle(const string& str, size_t width) {
+  const int kMargin = 3;  // Space for "...".
+  string result = str;
+  if (result.size() + kMargin > width) {
+    size_t elide_size = (width - kMargin) / 2;
+    result = result.substr(0, elide_size)
+      + "..."
+      + result.substr(result.size() - elide_size, elide_size);
+  }
+  return result;
 }

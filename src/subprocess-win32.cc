@@ -1,4 +1,4 @@
-// Copyright 2011 Google Inc. All Rights Reserved.
+// Copyright 2012 Google Inc. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,14 +20,6 @@
 
 #include "util.h"
 
-namespace {
-
-void Win32Fatal(const char* function) {
-  Fatal("%s: %s", function, GetLastErrorString().c_str());
-}
-
-}  // anonymous namespace
-
 Subprocess::Subprocess() : child_(NULL) , overlapped_(), is_reading_(false) {
 }
 
@@ -44,7 +36,7 @@ Subprocess::~Subprocess() {
 HANDLE Subprocess::SetupPipe(HANDLE ioport) {
   char pipe_name[100];
   snprintf(pipe_name, sizeof(pipe_name),
-           "\\\\.\\pipe\\ninja_pid%u_sp%p", GetCurrentProcessId(), this);
+           "\\\\.\\pipe\\ninja_pid%lu_sp%p", GetCurrentProcessId(), this);
 
   pipe_ = ::CreateNamedPipeA(pipe_name,
                              PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
@@ -80,15 +72,24 @@ HANDLE Subprocess::SetupPipe(HANDLE ioport) {
 bool Subprocess::Start(SubprocessSet* set, const string& command) {
   HANDLE child_pipe = SetupPipe(set->ioport_);
 
+  SECURITY_ATTRIBUTES security_attributes;
+  memset(&security_attributes, 0, sizeof(SECURITY_ATTRIBUTES));
+  security_attributes.nLength = sizeof(SECURITY_ATTRIBUTES);
+  security_attributes.bInheritHandle = TRUE;
+  // Must be inheritable so subprocesses can dup to children.
+  HANDLE nul = CreateFile("NUL", GENERIC_READ,
+          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+          &security_attributes, OPEN_EXISTING, 0, NULL);
+  if (nul == INVALID_HANDLE_VALUE)
+    Fatal("couldn't open nul");
+
   STARTUPINFOA startup_info;
   memset(&startup_info, 0, sizeof(startup_info));
   startup_info.cb = sizeof(STARTUPINFO);
   startup_info.dwFlags = STARTF_USESTDHANDLES;
+  startup_info.hStdInput = nul;
   startup_info.hStdOutput = child_pipe;
-  // TODO: what does this hook up stdin to?
-  startup_info.hStdInput  = NULL;
-  // TODO: is it ok to reuse pipe like this?
-  startup_info.hStdError  = child_pipe;
+  startup_info.hStdError = child_pipe;
 
   PROCESS_INFORMATION process_info;
   memset(&process_info, 0, sizeof(process_info));
@@ -104,6 +105,7 @@ bool Subprocess::Start(SubprocessSet* set, const string& command) {
       if (child_pipe)
         CloseHandle(child_pipe);
       CloseHandle(pipe_);
+      CloseHandle(nul);
       pipe_ = NULL;
       // child_ is already NULL;
       buf_ = "CreateProcess failed: The system cannot find the file specified.\n";
@@ -116,6 +118,7 @@ bool Subprocess::Start(SubprocessSet* set, const string& command) {
   // Close pipe channel only used by the child.
   if (child_pipe)
     CloseHandle(child_pipe);
+  CloseHandle(nul);
 
   CloseHandle(process_info.hThread);
   child_ = process_info.hProcess;
@@ -207,7 +210,7 @@ BOOL WINAPI SubprocessSet::NotifyInterrupted(DWORD dwCtrlType) {
   return FALSE;
 }
 
-Subprocess *SubprocessSet::Add(const string &command) {
+Subprocess *SubprocessSet::Add(const string& command) {
   Subprocess *subprocess = new Subprocess;
   if (!subprocess->Start(this, command)) {
     delete subprocess;
@@ -260,9 +263,12 @@ Subprocess* SubprocessSet::NextFinished() {
 void SubprocessSet::Clear() {
   for (vector<Subprocess*>::iterator i = running_.begin();
        i != running_.end(); ++i) {
-    if ((*i)->child_)
-      if (!GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, GetProcessId((*i)->child_)))
+    if ((*i)->child_) {
+      if (!GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT,
+                                    GetProcessId((*i)->child_))) {
         Win32Fatal("GenerateConsoleCtrlEvent");
+      }
+    }
   }
   for (vector<Subprocess*>::iterator i = running_.begin();
        i != running_.end(); ++i)

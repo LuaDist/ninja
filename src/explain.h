@@ -12,20 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef NINJA_WIN32PORT_H_
-#define NINJA_WIN32PORT_H_
+#ifndef NINJA_EXPLAIN_H_
+#define NINJA_EXPLAIN_H_
 
-typedef signed short int16_t;
-typedef unsigned short uint16_t;
-/// A 64-bit integer type
-typedef signed long long int64_t;
-typedef unsigned long long uint64_t;
+#include <stdio.h>
 
-// printf format specifier for uint64_t, from C99.
-#ifndef PRIu64
-#define PRIu64 "I64u"
-#define PRIx64 "I64x"
-#endif
+#define EXPLAIN(fmt, ...) {                                             \
+  if (g_explaining)                                                     \
+    fprintf(stderr, "ninja explain: " fmt "\n", __VA_ARGS__);           \
+}
 
-#endif // NINJA_WIN32PORT_H_
+extern bool g_explaining;
 
+#endif // NINJA_EXPLAIN_H_

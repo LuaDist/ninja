@@ -28,8 +28,11 @@ struct Edge;
 /// Information about a node in the dependency graph: the file, whether
 /// it's dirty, mtime, etc.
 struct Node {
-  Node(const string& path) : path_(path), mtime_(-1), dirty_(false),
-                             in_edge_(NULL) {}
+  explicit Node(const string& path)
+      : path_(path),
+        mtime_(-1),
+        dirty_(false),
+        in_edge_(NULL) {}
 
   /// Return true if the file exists (mtime_ got a value).
   bool Stat(DiskInterface* disk_interface);
@@ -74,6 +77,8 @@ struct Node {
   const vector<Edge*>& out_edges() const { return out_edges_; }
   void AddOutEdge(Edge* edge) { out_edges_.push_back(edge); }
 
+  void Dump(const char* prefix="") const;
+
 private:
   string path_;
   /// Possible values of mtime_:
@@ -97,7 +102,8 @@ private:
 
 /// An invokable build command and associated metadata (description, etc.).
 struct Rule {
-  Rule(const string& name) : name_(name), generator_(false), restat_(false) { }
+  explicit Rule(const string& name)
+      : name_(name), generator_(false), restat_(false) {}
 
   const string& name() const { return name_; }
 
@@ -105,11 +111,13 @@ struct Rule {
   bool restat() const { return restat_; }
 
   const EvalString& command() const { return command_; }
-  EvalString& command() { return command_; }
   const EvalString& description() const { return description_; }
   const EvalString& depfile() const { return depfile_; }
   const EvalString& rspfile() const { return rspfile_; }
   const EvalString& rspfile_content() const { return rspfile_content_; }
+
+  /// Used by a test.
+  void set_command(const EvalString& command) { command_ = command; }
 
  private:
   // Allow the parsers to reach into this object and fill out its fields.
@@ -136,39 +144,26 @@ struct Edge {
   Edge() : rule_(NULL), env_(NULL), outputs_ready_(false), implicit_deps_(0),
            order_only_deps_(0) {}
 
-  /// Examine inputs, outputs, and command lines to judge whether this edge
-  /// needs to be re-run, and update outputs_ready_ and each outputs' |dirty_|
-  /// state accordingly.
-  /// Returns false on failure.
-  bool RecomputeDirty(State* state, DiskInterface* disk_interface, string* err);
-
-  /// Recompute whether a given single output should be marked dirty.
-  /// Returns true if so.
-  bool RecomputeOutputDirty(BuildLog* build_log, TimeStamp most_recent_input,
-                            const string& command, Node* output);
-
   /// Return true if all inputs' in-edges are ready.
   bool AllInputsReady() const;
 
   /// Expand all variables in a command and return it as a string.
-  /// If incl_rsp_file is enabled, the string will also contain the 
+  /// If incl_rsp_file is enabled, the string will also contain the
   /// full contents of a response file (if applicable)
   string EvaluateCommand(bool incl_rsp_file = false);  // XXX move to env, take env ptr
   string EvaluateDepFile();
   string GetDescription();
-  
+
   /// Does the edge use a response file?
   bool HasRspFile();
-  
+
   /// Get the path to the response file
   string GetRspFile();
 
   /// Get the contents of the response file
   string GetRspFileContent();
 
-  bool LoadDepFile(State* state, DiskInterface* disk_interface, string* err);
-
-  void Dump();
+  void Dump(const char* prefix="") const;
 
   const Rule* rule_;
   vector<Node*> inputs_;
@@ -192,15 +187,50 @@ struct Edge {
   // pointer...)
   int implicit_deps_;
   int order_only_deps_;
-  bool is_implicit(int index) {
-    return index >= ((int)inputs_.size()) - order_only_deps_ - implicit_deps_ &&
+  bool is_implicit(size_t index) {
+    return index >= inputs_.size() - order_only_deps_ - implicit_deps_ &&
         !is_order_only(index);
   }
-  bool is_order_only(int index) {
-    return index >= ((int)inputs_.size()) - order_only_deps_;
+  bool is_order_only(size_t index) {
+    return index >= inputs_.size() - order_only_deps_;
   }
 
   bool is_phony() const;
+};
+
+
+/// DependencyScan manages the process of scanning the files in a graph
+/// and updating the dirty/outputs_ready state of all the nodes and edges.
+struct DependencyScan {
+  DependencyScan(State* state, BuildLog* build_log,
+                 DiskInterface* disk_interface)
+      : state_(state), build_log_(build_log),
+        disk_interface_(disk_interface) {}
+
+  /// Examine inputs, outputs, and command lines to judge whether an edge
+  /// needs to be re-run, and update outputs_ready_ and each outputs' |dirty_|
+  /// state accordingly.
+  /// Returns false on failure.
+  bool RecomputeDirty(Edge* edge, string* err);
+
+  /// Recompute whether a given single output should be marked dirty.
+  /// Returns true if so.
+  bool RecomputeOutputDirty(Edge* edge, Node* most_recent_input,
+                            const string& command, Node* output);
+
+  bool LoadDepFile(Edge* edge, string* err);
+
+  BuildLog* build_log() const {
+    return build_log_;
+  }
+  void set_build_log(BuildLog* log) {
+    build_log_ = log;
+  }
+
+ private:
+  State* state_;
+  BuildLog* build_log_;
+  DiskInterface* disk_interface_;
 };
 
 #endif  // NINJA_GRAPH_H_

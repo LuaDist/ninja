@@ -22,23 +22,21 @@ using namespace std;
 
 #include "hash_map.h"
 #include "timestamp.h"
+#include "util.h"  // uint64_t
 
-struct BuildConfig;
 struct Edge;
 
 /// Store a log of every command ran for every build.
 /// It has a few uses:
 ///
-/// 1) historical command lines for output files, so we know
+/// 1) (hashes of) command lines for existing output files, so we know
 ///    when we need to rebuild due to the command changing
-/// 2) historical timing information
-/// 3) maybe we can generate some sort of build overview output
-///    from it
+/// 2) timing information, perhaps for generating reports
+/// 3) restat information
 struct BuildLog {
   BuildLog();
   ~BuildLog();
 
-  void SetConfig(BuildConfig* config) { config_ = config; }
   bool OpenForWrite(const string& path, string* err);
   void RecordCommand(Edge* edge, int start_time, int end_time,
                      TimeStamp restat_mtime = 0);
@@ -49,17 +47,22 @@ struct BuildLog {
 
   struct LogEntry {
     string output;
-    string command;
+    uint64_t command_hash;
     int start_time;
     int end_time;
     TimeStamp restat_mtime;
 
+    static uint64_t HashCommand(StringPiece command);
+
     // Used by tests.
     bool operator==(const LogEntry& o) {
-      return output == o.output && command == o.command &&
+      return output == o.output && command_hash == o.command_hash &&
           start_time == o.start_time && end_time == o.end_time &&
           restat_mtime == o.restat_mtime;
     }
+
+    explicit LogEntry(const string& output);
+    LogEntry(const string& output, uint64_t command_hash, int start_time, int end_time, TimeStamp restat_mtime);
   };
 
   /// Lookup a previously-run command by its output path.
@@ -71,13 +74,12 @@ struct BuildLog {
   /// Rewrite the known log entries, throwing away old data.
   bool Recompact(const string& path, string* err);
 
-  typedef ExternalStringHashMap<LogEntry*>::Type Log;
-  const Log& log() const { return log_; }
+  typedef ExternalStringHashMap<LogEntry*>::Type Entries;
+  const Entries& entries() const { return entries_; }
 
  private:
-  Log log_;
+  Entries entries_;
   FILE* log_file_;
-  BuildConfig* config_;
   bool needs_recompaction_;
 };
 

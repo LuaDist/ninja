@@ -16,6 +16,8 @@
 
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <functional>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -23,6 +25,9 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/time.h>
+#endif
+
+#if defined(__SVR4) && defined(__sun)
 #include <sys/termios.h>
 #endif
 
@@ -33,47 +38,51 @@
 #include "subprocess.h"
 #include "util.h"
 
-/// Tracks the status of a build: completion fraction, printing updates.
-struct BuildStatus {
-  BuildStatus(const BuildConfig& config);
-  void PlanHasTotalEdges(int total);
-  void BuildEdgeStarted(Edge* edge);
-  void BuildEdgeFinished(Edge* edge, bool success, const string& output,
-                         int* start_time, int* end_time);
-  void BuildFinished();
+namespace {
+
+/// A CommandRunner that doesn't actually run the commands.
+class DryRunCommandRunner : public CommandRunner {
+ public:
+  virtual ~DryRunCommandRunner() {}
+
+  // Overridden from CommandRunner:
+  virtual bool CanRunMore();
+  virtual bool StartCommand(Edge* edge);
+  virtual Edge* WaitForCommand(ExitStatus* status, string* /* output */);
 
  private:
-  void PrintStatus(Edge* edge);
-
-  const BuildConfig& config_;
-
-  /// Time the build started.
-  int64_t start_time_millis_;
-  /// Time we last printed an update.
-  int64_t last_update_millis_;
-
-  int started_edges_, finished_edges_, total_edges_;
-
-  bool have_blank_line_;
-
-  /// Map of running edge to time the edge started running.
-  typedef map<Edge*, int> RunningEdgeMap;
-  RunningEdgeMap running_edges_;
-
-  /// Whether we can do fancy terminal control codes.
-  bool smart_terminal_;
-
-#ifdef _WIN32
-  HANDLE console_;
-#endif
+  queue<Edge*> finished_;
 };
+
+bool DryRunCommandRunner::CanRunMore() {
+  return true;
+}
+
+bool DryRunCommandRunner::StartCommand(Edge* edge) {
+  finished_.push(edge);
+  return true;
+}
+
+Edge* DryRunCommandRunner::WaitForCommand(ExitStatus* status,
+                                          string* /*output*/) {
+   if (finished_.empty()) {
+     *status = ExitFailure;
+     return NULL;
+   }
+   *status = ExitSuccess;
+   Edge* edge = finished_.front();
+   finished_.pop();
+   return edge;
+}
+
+}  // namespace
 
 BuildStatus::BuildStatus(const BuildConfig& config)
     : config_(config),
       start_time_millis_(GetTimeMillis()),
-      last_update_millis_(start_time_millis_),
       started_edges_(0), finished_edges_(0), total_edges_(0),
-      have_blank_line_(true) {
+      have_blank_line_(true), progress_status_format_(NULL),
+      overall_rate_(), current_rate_(config.parallelism) {
 #ifndef _WIN32
   const char* term = getenv("TERM");
   smart_terminal_ = isatty(1) && term && string(term) != "dumb";
@@ -91,6 +100,10 @@ BuildStatus::BuildStatus(const BuildConfig& config)
   // Don't do anything fancy in verbose mode.
   if (config_.verbosity != BuildConfig::NORMAL)
     smart_terminal_ = false;
+
+  progress_status_format_ = getenv("NINJA_STATUS");
+  if (!progress_status_format_)
+    progress_status_format_ = "[%s/%t] ";
 }
 
 void BuildStatus::PlanHasTotalEdges(int total) {
@@ -116,7 +129,6 @@ void BuildStatus::BuildEdgeFinished(Edge* edge,
   RunningEdgeMap::iterator i = running_edges_.find(edge);
   *start_time = i->second;
   *end_time = (int)(now - start_time_millis_);
-  int total_time = end_time - start_time;
   running_edges_.erase(i);
 
   if (config_.verbosity == BuildConfig::QUIET)
@@ -125,15 +137,7 @@ void BuildStatus::BuildEdgeFinished(Edge* edge,
   if (smart_terminal_)
     PrintStatus(edge);
 
-  if (success && output.empty()) {
-    if (!smart_terminal_) {
-      if (total_time > 5*1000) {
-        printf("%.1f%% %d/%d\n", finished_edges_ * 100 / (float)total_edges_,
-               finished_edges_, total_edges_);
-        last_update_millis_ = now;
-      }
-    }
-  } else {
+  if (!success || !output.empty()) {
     if (smart_terminal_)
       printf("\n");
 
@@ -171,6 +175,74 @@ void BuildStatus::BuildFinished() {
     printf("\n");
 }
 
+string BuildStatus::FormatProgressStatus(
+    const char* progress_status_format) const {
+  string out;
+  char buf[32];
+  for (const char* s = progress_status_format; *s != '\0'; ++s) {
+    if (*s == '%') {
+      ++s;
+      switch (*s) {
+      case '%':
+        out.push_back('%');
+        break;
+
+        // Started edges.
+      case 's':
+        snprintf(buf, sizeof(buf), "%d", started_edges_);
+        out += buf;
+        break;
+
+        // Total edges.
+      case 't':
+        snprintf(buf, sizeof(buf), "%d", total_edges_);
+        out += buf;
+        break;
+
+        // Running edges.
+      case 'r':
+        snprintf(buf, sizeof(buf), "%d", started_edges_ - finished_edges_);
+        out += buf;
+        break;
+
+        // Unstarted edges.
+      case 'u':
+        snprintf(buf, sizeof(buf), "%d", total_edges_ - started_edges_);
+        out += buf;
+        break;
+
+        // Finished edges.
+      case 'f':
+        snprintf(buf, sizeof(buf), "%d", finished_edges_);
+        out += buf;
+        break;
+
+        // Overall finished edges per second.
+      case 'o':
+        overall_rate_.UpdateRate(finished_edges_);
+        snprinfRate(overall_rate_.rate(), buf, "%.1f");
+        out += buf;
+        break;
+
+        // Current rate, average over the last '-j' jobs.
+      case 'c':
+        current_rate_.UpdateRate(finished_edges_);
+        snprinfRate(current_rate_.rate(), buf, "%.1f");
+        out += buf;
+        break;
+
+      default:
+        Fatal("unknown placeholder '%%%c' in $NINJA_STATUS", *s);
+        return "";
+      }
+    } else {
+      out.push_back(*s);
+    }
+  }
+
+  return out;
+}
+
 void BuildStatus::PrintStatus(Edge* edge) {
   if (config_.verbosity == BuildConfig::QUIET)
     return;
@@ -195,7 +267,11 @@ void BuildStatus::PrintStatus(Edge* edge) {
 #endif
   }
 
-  int progress_chars = printf("[%d/%d] ", started_edges_, total_edges_);
+  if (finished_edges_ == 0) {
+    overall_rate_.Restart();
+    current_rate_.Restart();
+  }
+  to_print = FormatProgressStatus(progress_status_format_) + to_print;
 
   if (smart_terminal_ && !force_full_command) {
 #ifndef _WIN32
@@ -203,43 +279,45 @@ void BuildStatus::PrintStatus(Edge* edge) {
     // line-wrapping.
     winsize size;
     if ((ioctl(0, TIOCGWINSZ, &size) == 0) && size.ws_col) {
-      const int kMargin = progress_chars + 3;  // Space for [xx/yy] and "...".
-      if (to_print.size() + kMargin > size.ws_col) {
-        int elide_size = (size.ws_col - kMargin) / 2;
-        to_print = to_print.substr(0, elide_size)
-          + "..."
-          + to_print.substr(to_print.size() - elide_size, elide_size);
-      }
+      to_print = ElideMiddle(to_print, size.ws_col);
     }
 #else
-    const int kMargin = progress_chars + 3;  // Space for [xx/yy] and "...".
-    // Don't use the full width or console with move to next line.
+    // Don't use the full width or console will move to next line.
     size_t width = static_cast<size_t>(csbi.dwSize.X) - 1;
-    if (to_print.size() + kMargin > width) {
-      int elide_size = (width - kMargin) / 2;
-      to_print = to_print.substr(0, elide_size)
-        + "..."
-        + to_print.substr(to_print.size() - elide_size, elide_size);
-    }
+    to_print = ElideMiddle(to_print, width);
 #endif
   }
 
-  printf("%s", to_print.c_str());
-
   if (smart_terminal_ && !force_full_command) {
 #ifndef _WIN32
+    printf("%s", to_print.c_str());
     printf("\x1B[K");  // Clear to end of line.
     fflush(stdout);
     have_blank_line_ = false;
 #else
-    // Clear to end of line.
+    // We don't want to have the cursor spamming back and forth, so
+    // use WriteConsoleOutput instead which updates the contents of
+    // the buffer, but doesn't move the cursor position.
     GetConsoleScreenBufferInfo(console_, &csbi);
-    int num_spaces = csbi.dwSize.X - 1 - csbi.dwCursorPosition.X;
-    printf("%*s", num_spaces, "");
+    COORD buf_size = { csbi.dwSize.X, 1 };
+    COORD zero_zero = { 0, 0 };
+    SMALL_RECT target = { csbi.dwCursorPosition.X, csbi.dwCursorPosition.Y,
+                          (SHORT)(csbi.dwCursorPosition.X + csbi.dwSize.X - 1),
+                          csbi.dwCursorPosition.Y };
+    CHAR_INFO* char_data = new CHAR_INFO[csbi.dwSize.X];
+    memset(char_data, 0, sizeof(CHAR_INFO) * csbi.dwSize.X);
+    for (int i = 0; i < csbi.dwSize.X; ++i) {
+      char_data[i].Char.AsciiChar = ' ';
+      char_data[i].Attributes = csbi.wAttributes;
+    }
+    for (size_t i = 0; i < to_print.size(); ++i)
+      char_data[i].Char.AsciiChar = to_print[i];
+    WriteConsoleOutput(console_, char_data, buf_size, zero_zero, &target);
+    delete[] char_data;
     have_blank_line_ = false;
 #endif
   } else {
-    printf("\n");
+    printf("%s\n", to_print.c_str());
   }
 }
 
@@ -366,7 +444,7 @@ void Plan::NodeFinished(Node* node) {
   }
 }
 
-void Plan::CleanNode(BuildLog* build_log, Node* node) {
+void Plan::CleanNode(DependencyScan* scan, Node* node) {
   node->set_dirty(false);
 
   for (vector<Edge*>::const_iterator ei = node->out_edges().begin();
@@ -382,12 +460,13 @@ void Plan::CleanNode(BuildLog* build_log, Node* node) {
                             end = (*ei)->inputs_.end() - (*ei)->order_only_deps_;
     if (find_if(begin, end, mem_fun(&Node::dirty)) == end) {
       // Recompute most_recent_input and command.
-      TimeStamp most_recent_input = 1;
-      for (vector<Node*>::iterator ni = begin; ni != end; ++ni)
-        if ((*ni)->mtime() > most_recent_input)
-          most_recent_input = (*ni)->mtime();
+      Node* most_recent_input = NULL;
+      for (vector<Node*>::iterator ni = begin; ni != end; ++ni) {
+        if (!most_recent_input || (*ni)->mtime() > most_recent_input->mtime())
+          most_recent_input = *ni;
+      }
       string command = (*ei)->EvaluateCommand(true);
-      
+
       // Now, recompute the dirty state of each output.
       bool all_outputs_clean = true;
       for (vector<Node*>::iterator ni = (*ei)->outputs_.begin();
@@ -395,12 +474,12 @@ void Plan::CleanNode(BuildLog* build_log, Node* node) {
         if (!(*ni)->dirty())
           continue;
 
-        if ((*ei)->RecomputeOutputDirty(build_log, most_recent_input, command,
-                                        *ni)) {
+        if (scan->RecomputeOutputDirty(*ei, most_recent_input,
+                                       command, *ni)) {
           (*ni)->MarkDirty();
           all_outputs_clean = false;
         } else {
-          CleanNode(build_log, *ni);
+          CleanNode(scan, *ni);
         }
       }
 
@@ -426,7 +505,7 @@ void Plan::Dump() {
 }
 
 struct RealCommandRunner : public CommandRunner {
-  RealCommandRunner(const BuildConfig& config) : config_(config) {}
+  explicit RealCommandRunner(const BuildConfig& config) : config_(config) {}
   virtual ~RealCommandRunner() {}
   virtual bool CanRunMore();
   virtual bool StartCommand(Edge* edge);
@@ -452,7 +531,9 @@ void RealCommandRunner::Abort() {
 }
 
 bool RealCommandRunner::CanRunMore() {
-  return ((int)subprocs_.running_.size()) < config_.parallelism;
+  return ((int)subprocs_.running_.size()) < config_.parallelism
+    && ((subprocs_.running_.empty() || config_.max_load_average <= 0.0f)
+        || GetLoadAverage() < config_.max_load_average);
 }
 
 bool RealCommandRunner::StartCommand(Edge* edge) {
@@ -461,7 +542,7 @@ bool RealCommandRunner::StartCommand(Edge* edge) {
   if (!subproc)
     return false;
   subproc_to_edge_.insert(make_pair(subproc, edge));
-  
+
   return true;
 }
 
@@ -486,39 +567,11 @@ Edge* RealCommandRunner::WaitForCommand(ExitStatus* status, string* output) {
   return edge;
 }
 
-/// A CommandRunner that doesn't actually run the commands.
-struct DryRunCommandRunner : public CommandRunner {
-  virtual ~DryRunCommandRunner() {}
-  virtual bool CanRunMore() {
-    return true;
-  }
-  virtual bool StartCommand(Edge* edge) {
-    finished_.push(edge);
-    return true;
-  }
-  virtual Edge* WaitForCommand(ExitStatus* status, string* /* output */) {
-    if (finished_.empty()) {
-      *status = ExitFailure;
-      return NULL;
-    }
-    *status = ExitSuccess;
-    Edge* edge = finished_.front();
-    finished_.pop();
-    return edge;
-  }
-
-  queue<Edge*> finished_;
-};
-
-Builder::Builder(State* state, const BuildConfig& config)
-    : state_(state), config_(config) {
-  disk_interface_ = new RealDiskInterface;
-  if (config.dry_run)
-    command_runner_.reset(new DryRunCommandRunner);
-  else
-    command_runner_.reset(new RealCommandRunner(config));
+Builder::Builder(State* state, const BuildConfig& config,
+                 BuildLog* log, DiskInterface* disk_interface)
+    : state_(state), config_(config), disk_interface_(disk_interface),
+      scan_(state, log, disk_interface) {
   status_ = new BuildStatus(config);
-  log_ = state->build_log_;
 }
 
 Builder::~Builder() {
@@ -566,7 +619,7 @@ Node* Builder::AddTarget(const string& name, string* err) {
 bool Builder::AddTarget(Node* node, string* err) {
   node->StatIfNecessary(disk_interface_);
   if (Edge* in_edge = node->in_edge()) {
-    if (!in_edge->RecomputeDirty(state_, disk_interface_, err))
+    if (!scan_.RecomputeDirty(in_edge, err))
       return false;
     if (in_edge->outputs_ready())
       return true;  // Nothing to do.
@@ -588,6 +641,14 @@ bool Builder::Build(string* err) {
   status_->PlanHasTotalEdges(plan_.command_edge_count());
   int pending_commands = 0;
   int failures_allowed = config_.failures_allowed;
+
+  // Set up the command runner if we haven't done so already.
+  if (!command_runner_.get()) {
+    if (config_.dry_run)
+      command_runner_.reset(new DryRunCommandRunner);
+    else
+      command_runner_.reset(new RealCommandRunner(config_));
+  }
 
   // This main loop runs the entire build process.
   // It is structured like this:
@@ -656,7 +717,7 @@ bool Builder::Build(string* err) {
         *err = "subcommand failed";
     } else if (failures_allowed < config_.failures_allowed)
       *err = "cannot make progress due to previous errors";
-    else 
+    else
       *err = "stuck [this is a bug]";
 
     return false;
@@ -667,6 +728,7 @@ bool Builder::Build(string* err) {
 }
 
 bool Builder::StartEdge(Edge* edge, string* err) {
+  METRIC_RECORD("StartEdge");
   if (edge->is_phony())
     return true;
 
@@ -679,11 +741,11 @@ bool Builder::StartEdge(Edge* edge, string* err) {
     if (!disk_interface_->MakeDirs((*i)->path()))
       return false;
   }
-  
+
   // Create response file, if needed
   // XXX: this may also block; do we care?
   if (edge->HasRspFile()) {
-    if (!disk_interface_->WriteFile(edge->GetRspFile(), edge->GetRspFileContent())) 
+    if (!disk_interface_->WriteFile(edge->GetRspFile(), edge->GetRspFileContent()))
       return false;
   }
 
@@ -697,6 +759,7 @@ bool Builder::StartEdge(Edge* edge, string* err) {
 }
 
 void Builder::FinishEdge(Edge* edge, bool success, const string& output) {
+  METRIC_RECORD("FinishEdge");
   TimeStamp restat_mtime = 0;
 
   if (success) {
@@ -710,7 +773,7 @@ void Builder::FinishEdge(Edge* edge, bool success, const string& output) {
           // The rule command did not change the output.  Propagate the clean
           // state through the build graph.
           // Note that this also applies to nonexistent outputs (mtime == 0).
-          plan_.CleanNode(log_, *i);
+          plan_.CleanNode(&scan_, *i);
           node_cleaned = true;
         }
       }
@@ -721,19 +784,13 @@ void Builder::FinishEdge(Edge* edge, bool success, const string& output) {
         for (vector<Node*>::iterator i = edge->inputs_.begin();
              i != edge->inputs_.end() - edge->order_only_deps_; ++i) {
           TimeStamp input_mtime = disk_interface_->Stat((*i)->path());
-          if (input_mtime == 0) {
-            restat_mtime = 0;
-            break;
-          }
           if (input_mtime > restat_mtime)
             restat_mtime = input_mtime;
         }
 
         if (restat_mtime != 0 && !edge->rule().depfile().empty()) {
           TimeStamp depfile_mtime = disk_interface_->Stat(edge->EvaluateDepFile());
-          if (depfile_mtime == 0)
-            restat_mtime = 0;
-          else if (depfile_mtime > restat_mtime)
+          if (depfile_mtime > restat_mtime)
             restat_mtime = depfile_mtime;
         }
 
@@ -744,7 +801,7 @@ void Builder::FinishEdge(Edge* edge, bool success, const string& output) {
     }
 
     // delete the response file on success (if exists)
-    if (edge->HasRspFile()) 
+    if (edge->HasRspFile())
       disk_interface_->RemoveFile(edge->GetRspFile());
 
     plan_.EdgeFinished(edge);
@@ -755,6 +812,7 @@ void Builder::FinishEdge(Edge* edge, bool success, const string& output) {
 
   int start_time, end_time;
   status_->BuildEdgeFinished(edge, success, output, &start_time, &end_time);
-  if (success && log_)
-    log_->RecordCommand(edge, start_time, end_time, restat_mtime);
+  if (success && scan_.build_log())
+    scan_.build_log()->RecordCommand(edge, start_time, end_time, restat_mtime);
 }
+

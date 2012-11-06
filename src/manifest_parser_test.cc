@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "parsers.h"
+#include "manifest_parser.h"
 
 #include <gtest/gtest.h>
 
@@ -64,6 +64,20 @@ TEST_F(ParserTest, Rules) {
   EXPECT_EQ("[cat ][$in][ > ][$out]", rule->command().Serialize());
 }
 
+TEST_F(ParserTest, RuleAttributes) {
+  // Check that all of the allowed rule attributes are parsed ok.
+  ASSERT_NO_FATAL_FAILURE(AssertParse(
+"rule cat\n"
+"  command = a\n"
+"  depfile = a\n"
+"  description = a\n"
+"  generator = a\n"
+"  restat = a\n"
+"  rspfile = a\n"
+"  rspfile_content = a\n"
+));
+}
+
 TEST_F(ParserTest, IgnoreIndentedComments) {
   ASSERT_NO_FATAL_FAILURE(AssertParse(
 "  #indented comment\n"
@@ -113,6 +127,23 @@ TEST_F(ParserTest, ResponseFiles) {
   EXPECT_EQ("[cat ][$rspfile][ > ][$out]", rule->command().Serialize());
   EXPECT_EQ("[$rspfile]", rule->rspfile().Serialize());
   EXPECT_EQ("[$in]", rule->rspfile_content().Serialize());
+}
+
+TEST_F(ParserTest, InNewline) {
+  ASSERT_NO_FATAL_FAILURE(AssertParse(
+"rule cat_rsp\n"
+"  command = cat $in_newline > $out\n"
+"\n"
+"build out: cat_rsp in in2\n"
+"  rspfile=out.rsp\n"));
+
+  ASSERT_EQ(2u, state.rules_.size());
+  const Rule* rule = state.rules_.begin()->second;
+  EXPECT_EQ("cat_rsp", rule->name());
+  EXPECT_EQ("[cat ][$in_newline][ > ][$out]", rule->command().Serialize());
+
+  Edge* edge = state.edges_[0];
+  EXPECT_EQ("cat in\nin2 > out", edge->EvaluateCommand());
 }
 
 TEST_F(ParserTest, Variables) {
@@ -657,4 +688,31 @@ TEST_F(ParserTest, DefaultStatements) {
   EXPECT_EQ("a", nodes[0]->path());
   EXPECT_EQ("b", nodes[1]->path());
   EXPECT_EQ("c", nodes[2]->path());
+}
+
+TEST_F(ParserTest, UTF8) {
+  ASSERT_NO_FATAL_FAILURE(AssertParse(
+"rule utf8\n"
+"  command = true\n"
+"  description = compilaci\xC3\xB3\n"));
+}
+
+// We might want to eventually allow CRLF to be nice to Windows developers,
+// but for now just verify we error out with a nice message.
+TEST_F(ParserTest, CRLF) {
+  State state;
+  ManifestParser parser(&state, NULL);
+  string err;
+
+  EXPECT_FALSE(parser.ParseTest("# comment with crlf\r\n",
+                                &err));
+  EXPECT_EQ("input:1: lexing error\n",
+            err);
+
+  EXPECT_FALSE(parser.ParseTest("foo = foo\nbar = bar\r\n",
+                                &err));
+  EXPECT_EQ("input:2: carriage returns are not allowed, use newlines\n"
+            "bar = bar\r\n"
+            "         ^ near here",
+            err);
 }
